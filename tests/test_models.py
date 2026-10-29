@@ -707,6 +707,56 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_mobilemoe_transposed_experts(self):
+        from dataclasses import replace
+
+        from mlx_lm.models import mobilemoe
+
+        # Experts must compute x @ W for W stored as [E, in, out].
+        proj = mobilemoe.TransposedQuantizedSwitchLinear(64, 96, 4, 32, 4)
+        dense = mx.dequantize(proj.weight, proj.scales, proj.biases, 32, 4)
+        x = mx.random.normal((3, 1, 1, 64))
+        indices = mx.array([[0, 2], [1, 3], [3, 3]])
+        expected = mx.stack(
+            [
+                mx.stack([x[t, 0, 0] @ dense[e] for e in row])
+                for t, row in enumerate(indices.tolist())
+            ]
+        )
+        self.assertTrue(mx.allclose(proj(x, indices)[..., 0, :], expected, atol=1e-4))
+
+        args = mobilemoe.ModelArgs(
+            model_type="mobilemoe",
+            hidden_size=128,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            intermediate_size_mlp=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-5,
+            vocab_size=1000,
+            rope_theta=500000.0,
+            max_position_embeddings=8192,
+            quantization={"group_size": 32, "bits": 4},
+            transposed_experts=True,
+        )
+        model = mobilemoe.Model(args)
+        experts = model.layers[0].feed_forward.experts
+        self.assertEqual(experts.gate_proj.weight.shape, (8, 128, 64 // 8))
+        self.assertEqual(experts.down_proj.weight.shape, (8, 64, 128 // 8))
+
+        cache = make_prompt_cache(model)
+        outputs = model(mx.array([[0, 1]]), cache=cache)
+        self.assertEqual(outputs.shape, (1, 2, args.vocab_size))
+        outputs = model(mx.array([[2]]), cache=cache)
+        self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
+
+        with self.assertRaises(ValueError):
+            replace(args, quantization=None)
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 

@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -37,12 +38,17 @@ class ModelArgs(BaseModelArgs):
     routed_scaling_factor: float = 2.5
     norm_topk_prob: bool = True
     tie_word_embeddings: bool = True
+    quantization: Optional[Dict[str, Any]] = None
+    # Meta's int4 checkpoints store experts as [E, in, out], grouped along out.
+    transposed_experts: bool = False
 
     def __post_init__(self):
         if self.no_rope_layers is None:
             self.no_rope_layers = [1] * self.num_hidden_layers
         if self.attn_temperature_tuning:
             raise ValueError("MobileMoE: attn_temperature_tuning is not supported.")
+        if self.transposed_experts and self.quantization is None:
+            raise ValueError("MobileMoE: transposed_experts needs a quantization.")
 
 
 class QKNorm(nn.Module):
@@ -133,10 +139,56 @@ class MLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+class TransposedQuantizedSwitchLinear(nn.Module):
+    """Quantized expert weights in [E, in, out] layout, grouped along out."""
+
+    def __init__(
+        self,
+        input_dims: int,
+        output_dims: int,
+        num_experts: int,
+        group_size: int,
+        bits: int,
+        mode: str = "affine",
+    ):
+        super().__init__()
+        scale = math.sqrt(1 / input_dims)
+        self.weight, self.scales, *biases = mx.quantize(
+            mx.random.uniform(
+                low=-scale,
+                high=scale,
+                shape=(num_experts, input_dims, output_dims),
+            ),
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+        self.biases = biases[0] if biases else None
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.freeze()
+
+    def __call__(self, x, indices, sorted_indices=False):
+        return mx.gather_qmm(
+            x,
+            self["weight"],
+            self["scales"],
+            self.get("biases"),
+            rhs_indices=indices,
+            transpose=False,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=sorted_indices,
+        )
+
+
 class MoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         dim = args.hidden_size
+        hidden = args.intermediate_size
         num_experts = args.num_local_experts
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
@@ -144,7 +196,22 @@ class MoE(nn.Module):
 
         self.router = nn.Linear(dim, num_experts, bias=False)
         self.expert_bias = mx.zeros((num_experts,))
-        self.experts = SwitchGLU(dim, args.intermediate_size, num_experts)
+        self.experts = SwitchGLU(dim, hidden, num_experts)
+        if args.transposed_experts:
+            q = args.quantization
+            for name, dims in (
+                ("gate_proj", (dim, hidden)),
+                ("up_proj", (dim, hidden)),
+                ("down_proj", (hidden, dim)),
+            ):
+                proj = TransposedQuantizedSwitchLinear(
+                    *dims,
+                    num_experts,
+                    q["group_size"],
+                    q["bits"],
+                    q.get("mode", "affine"),
+                )
+                setattr(self.experts, name, proj)
         self.shared_expert = MLP(dim, args.intermediate_size_mlp)
 
     def __call__(self, x: mx.array) -> mx.array:
