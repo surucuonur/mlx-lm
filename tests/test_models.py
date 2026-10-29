@@ -674,6 +674,39 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_mobilemoe(self):
+        from mlx_lm.models import mobilemoe
+
+        args = mobilemoe.ModelArgs(
+            model_type="mobilemoe",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            intermediate_size_mlp=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-5,
+            vocab_size=1000,
+            rope_theta=500000.0,
+            max_position_embeddings=8192,
+            rope_scaling={
+                "rope_type": "llama3",
+                "factor": 16,
+                "original_max_position_embeddings": 8192,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 1.0,
+            },
+            interleave_moe_layer_step=2,
+            no_rope_layers=[1, 1, 0, 1],
+        )
+        model = mobilemoe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
